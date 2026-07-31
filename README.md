@@ -2,14 +2,14 @@
 
 CircadianWallpaper automatically changes your desktop wallpaper based on real astronomical data for your location.
 
-## 🚀 Quick Start
+## Quick Start
 
 To run every time you login - Compile or move CircadianWallpaper.exe here:
    ```
    %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
    ```
 
-## 🌟 Key Features
+## Key Features
 
 ### Real Astronomical Data
 - Seasonal Accuracy: Colors automatically adjust throughout the year as sunrise/sunset times shift
@@ -18,7 +18,7 @@ To run every time you login - Compile or move CircadianWallpaper.exe here:
 - Regular Schedule: Automatically fetches fresh solar data each day
 - Backup Coordinates: Manual coordinates serve as fallback if detection fails
 
-## 🌅 Color Schedule
+## Color Schedule
 
 Colors change based on your location's actual solar times:
 
@@ -33,7 +33,7 @@ Colors change based on your location's actual solar times:
 - Civil Twilight → Dark slate blue
 - Evening → Deep purple
 
-## ⚙️ Optional Configuration
+## Optional Configuration
 
 Edit `config.ini` to customize:
 
