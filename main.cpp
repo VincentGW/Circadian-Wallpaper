@@ -1,6 +1,10 @@
+#define _USE_MATH_DEFINES
 #include <Windows.h>
 #include <Dbt.h>
 #include <SFML/Graphics.hpp>
+#include <array>
+#include <cstdint>
+#include <iterator>
 #include <iostream>
 #include <ctime>
 #include <cmath>
@@ -15,6 +19,7 @@
 #include <memory>
 #include <unordered_map>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <atomic>
@@ -142,23 +147,20 @@ private:
     };
 
     Config config;
-    bool demoMode; // --demo: render offscreen snapshots instead of live windows
+    bool offscreenMode; // --earth-preview: no windows, no network, render offscreen only
     std::vector<MonitorWindow> monitors;
-    // Earth animation: 288 frames forming one full rotation, tied to UTC time
-    // of day. One frame per kEarthMinutesPerFrame minutes (288 * 5 min = 24 h),
-    // so the earth completes exactly one rotation per day. earth_000 is the
-    // frame shown at 12:00 (noon) UTC.
-    static const int kEarthFrameCount = 288;
-    static const int kEarthMinutesPerFrame = 5; // wall-clock minutes per frame
-    // Frames are decoded one-at-a-time. To make that cheap and immune to
-    // disk-cache eviction, the compressed PNG bytes of every frame are held in
-    // RAM (~5 MB total) and decoded from memory; only ONE frame is ever decoded
-    // into a VRAM texture at a time (~2 MB), so memory stays tiny.
-    std::vector<std::vector<unsigned char>> earthFrameData; // raw PNG bytes per frame
-    sf::Texture earthTexture;       // the one frame currently decoded
-    int loadedEarthFrame;           // which index earthTexture holds (-1 = none)
-    int earthFramesAvailable;       // count of frames present
-    int currentEarthFrame;          // frame currently shown (derived from UTC time)
+    // Earth globe: rasterized by the app from vector coastlines (earth_land.bin,
+    // Natural Earth 1:110m land, ~16 KB) rather than from pre-rendered frames.
+    // The view longitude is tied to UTC time of day: longitude 0 faces the
+    // viewer at 12:00 UTC and the globe turns 0.25 deg per minute, so it
+    // completes exactly one rotation per day. It is re-rendered once a minute.
+    static const int kEarthSize = 768;            // globe texture is kEarthSize^2
+    static const int kEarthMinutesPerDay = 24 * 60;
+    static constexpr double kEarthRimPx = 1.5;    // opaque outline at the disc edge
+    struct EarthVec { float x, y, z; };           // unit vector: x->lon 0, y->lon 90E, z->north
+    std::vector<std::vector<EarthVec>> earthRings; // coastline rings (~4k vertices, ~50 KB)
+    sf::Texture earthTexture;       // the rendered globe (the only large earth asset)
+    int renderedEarthMinute;        // minute-since-noon-UTC earthTexture shows (-1 = none)
     bool hasWatermark;
     time_t lastAccentColorUpdate;
     sf::Shader watermarkShader;
@@ -182,11 +184,8 @@ private:
         double gamma;
     };
 
-    std::vector<ColorPoint> todaysColors;
     SolarTimes todaysSolarTimes;
     SolarCache solarCache;
-    std::string lastFetchDate;
-    std::string currentPeriodCache;
 
     // Async solar fetch. All HTTP happens on this worker thread so the render
     // loop never blocks on the network: the old synchronous fetch (up to 8
@@ -250,7 +249,8 @@ private:
             "CircadianWallpaper",
             sf::Style::None
         );
-        m.window->setFramerateLimit(60);
+        // No setFramerateLimit: presentation is driven by the change-detecting
+        // main loop, not by SFML's internal sleep-to-cap logic.
         m.window->setPosition(sf::Vector2i(m.x, m.y));
 
         HWND hwnd = m.window->getSystemHandle();
@@ -286,10 +286,11 @@ private:
         }
 
         if (hasWatermark) {
-            // Ensure the current frame is decoded, then bind the single texture.
-            // updateEarthFrameSprites() refreshes this every tick; this just
-            // gives a newly-(re)created window something correct to show now.
-            if (loadEarthFrame(currentEarthFrame) && earthTexture.getSize().x != 0) {
+            // Ensure the globe is rendered for the current minute, then bind the
+            // single texture. updateEarthSprites() refreshes this every
+            // tick; this just gives a newly-(re)created window something
+            // correct to show now.
+            if (ensureEarthRendered(computeEarthMinuteForNow()) && earthTexture.getSize().x != 0) {
                 m.watermarkSprite.setTexture(earthTexture, true);
                 sf::FloatRect bounds = m.watermarkSprite.getLocalBounds();
                 m.watermarkSprite.setOrigin(bounds.width / 2.0f, bounds.height / 2.0f);
@@ -390,6 +391,39 @@ private:
         logMessage("Monitor topology reconciled: " + std::to_string(monitors.size()) + " monitor(s)");
     }
 
+    // Read-only check: does the live display topology (EnumDisplayMonitors,
+    // queried fresh right now) still match what `monitors` thinks it is?
+    // WM_DISPLAYCHANGE/WM_DEVICECHANGE fire during a hotplug transition, not
+    // after it settles — EnumDisplayMonitors called immediately (or even ~1s
+    // later, per the debounce below) can return a stale or half-applied
+    // topology. Reconciling against that bad snapshot produces a wrongly
+    // sized window (unplug) or silently drops a just-added monitor (plug),
+    // and since the event-driven reconcile only runs once per burst, nothing
+    // ever corrects it. This is polled periodically as a safety net so a bad
+    // reconcile gets caught and retried instead of persisting indefinitely.
+    bool topologyMismatch() {
+        std::vector<MonitorRect> current;
+        EnumDisplayMonitors(NULL, NULL, MonitorRectEnumProc, reinterpret_cast<LPARAM>(&current));
+
+        if (current.size() != monitors.size()) return true;
+
+        std::vector<bool> matched(current.size(), false);
+        for (const auto& m : monitors) {
+            bool found = false;
+            for (size_t i = 0; i < current.size(); i++) {
+                if (matched[i]) continue;
+                if (current[i].x == m.x && current[i].y == m.y &&
+                    current[i].width == m.width && current[i].height == m.height) {
+                    matched[i] = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return true;
+        }
+        return false;
+    }
+
     // True when nothing but our own wallpaper windows and the shell's desktop
     // windows (Progman / WorkerW, which legitimately live at the very bottom)
     // sit below `hwnd` in z-order — i.e. re-pinning would be a no-op.
@@ -424,12 +458,12 @@ private:
     }
 
 public:
-    CircadianWallpaper(bool demo = false) : demoMode(demo), loadedEarthFrame(-1), earthFramesAvailable(0), currentEarthFrame(0), hasWatermark(false), lastAccentColorUpdate(0), watermarkShaderLoaded(false), gradientShaderLoaded(false) {
+    CircadianWallpaper(bool offscreen = false) : offscreenMode(offscreen), renderedEarthMinute(-1), hasWatermark(false), lastAccentColorUpdate(0), watermarkShaderLoaded(false), gradientShaderLoaded(false) {
         std::cout << "Initializing CircadianWallpaper..." << std::endl;
 
         loadConfig();
 
-        if (config.auto_detect_location && !demoMode) {
+        if (config.auto_detect_location && !offscreenMode) {
             autoDetectLocation();
         }
 
@@ -587,9 +621,9 @@ void main() {
             fullscreenTexReady = fullscreenTex.loadFromImage(white);
         }
 
-        // Enumerate all monitors and create windows — skipped in demo mode,
-        // which renders offscreen only (see runDemo()).
-        if (!demoMode) {
+        // Enumerate all monitors and create windows — skipped in offscreen
+        // mode (see runEarthPreview()).
+        if (!offscreenMode) {
             EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, reinterpret_cast<LPARAM>(&monitors));
 
             std::cout << "Found " << monitors.size() << " monitor(s)" << std::endl;
@@ -924,40 +958,32 @@ void main() {
         }
     }
     
+    // Convert an ISO-8601 UTC timestamp from the API
+    // ("2026-11-02T22:02:18+00:00") to a local hour-of-day. The conversion
+    // goes through the CRT's localtime so the DST rule in force ON THAT DATE
+    // applies, not today's. The old code applied today's DST state to every
+    // day in the 8-day cache, so a fetch made before a DST change stamped
+    // the wrong offset onto the days after it (sunset an hour late).
     double parseTimeString(const std::string& timeStr) {
-        if (timeStr.length() < 19) return 0.0;
-        
-        std::string timeOnly = timeStr.substr(11, 8);
-        int hours, minutes, seconds;
-        char colon1, colon2;
-        
-        std::stringstream ss(timeOnly);
-        if (ss >> hours >> colon1 >> minutes >> colon2 >> seconds) {
-            double utcHour = hours + (minutes / 60.0) + (seconds / 3600.0);
-            
-            // Get current system timezone info to determine if DST is active
-            TIME_ZONE_INFORMATION tzi;
-            DWORD tziResult = GetTimeZoneInformation(&tzi);
-            
-            double offsetHours;
-            if (tziResult == TIME_ZONE_ID_DAYLIGHT) {
-                // DST is active - use daylight bias
-                offsetHours = -(tzi.Bias + tzi.DaylightBias) / 60.0;
-            } else {
-                // Standard time - use standard bias
-                offsetHours = -(tzi.Bias + tzi.StandardBias) / 60.0;
-            }
-            
-            double localHour = utcHour + offsetHours;
-            if (localHour < 0) localHour += 24.0;
-            if (localHour >= 24) localHour -= 24.0;
-            
-            return localHour;
+        int Y, M, D, h, m, s;
+        if (std::sscanf(timeStr.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) != 6) {
+            return 0.0;
         }
-        
-        return 0.0;
+        tm utc;
+        std::memset(&utc, 0, sizeof(utc));
+        utc.tm_year = Y - 1900;
+        utc.tm_mon  = M - 1;
+        utc.tm_mday = D;
+        utc.tm_hour = h;
+        utc.tm_min  = m;
+        utc.tm_sec  = s;
+        time_t t = _mkgmtime(&utc);
+        if (t == (time_t)-1) return 0.0;
+        tm* local = localtime(&t);
+        if (!local) return 0.0;
+        return local->tm_hour + local->tm_min / 60.0 + local->tm_sec / 3600.0;
     }
-    
+
     double parseTimeFromJson(const std::string& json, const std::string& key) {
         size_t keyPos = json.find(key);
         if (keyPos == std::string::npos) return 0.0;
@@ -1151,10 +1177,17 @@ void main() {
         return ss.str();
     }
 
+    // Local calendar date `dayOffset` days from today. Uses calendar
+    // arithmetic (mktime normalizes tm_mday) rather than adding 86400 s: on
+    // the 25-hour day a DST change ends, the seconds approach landed on the
+    // same date twice and the cache got two entries for one day.
     std::string getDateOffset(int dayOffset) {
         time_t now = time(0);
-        now += dayOffset * 24 * 60 * 60; // Add/subtract days
-        tm* timeinfo = localtime(&now);
+        tm local = *localtime(&now);
+        local.tm_mday += dayOffset;
+        local.tm_isdst = -1;
+        mktime(&local);
+        tm* timeinfo = &local;
 
         std::stringstream ss;
         ss << (timeinfo->tm_year + 1900) << "-"
@@ -1258,7 +1291,8 @@ void main() {
         return true;
     }
     
-    void generateTodaysColors() {
+    // Debug-mode log of the solar times the palette is built around.
+    void logSolarSchedule() {
         if (config.debug_mode) {
             logMessage("Solar-based continuous color calculation initialized");
             logMessage("  Sunrise: " + formatHour(todaysSolarTimes.sunrise_hour));
@@ -1267,49 +1301,6 @@ void main() {
             logMessage("  Civil Twilight End: " + formatHour(todaysSolarTimes.civil_twilight_end));
         }
     }
-    
-    void generateDebugCSV() {
-        std::string csvPath = getConfigPath();
-        size_t lastSlash = csvPath.find_last_of("\\/");
-        if (lastSlash != std::string::npos) {
-            csvPath = csvPath.substr(0, lastSlash + 1) + "daily_colors.csv";
-        } else {
-            csvPath = "daily_colors.csv";
-        }
-        
-        std::ofstream csvFile(csvPath);
-        if (!csvFile.is_open()) {
-            logMessage("Failed to create debug CSV file: " + csvPath);
-            return;
-        }
-        
-        // Write CSV header
-        csvFile << "Time,Hour,Minute,R,G,B,Period" << std::endl;
-        
-        // Generate colors for each minute of the day
-        for (int hour = 0; hour < 24; hour++) {
-            for (int minute = 0; minute < 60; minute++) {
-                double timeHour = hour + (minute / 60.0);
-                std::string period;
-                Color color = getColorForHour(timeHour, &period);
-
-                // Format time as HH:MM
-                std::stringstream timeStr;
-                timeStr << std::setfill('0') << std::setw(2) << hour
-                       << ":" << std::setw(2) << minute;
-
-                csvFile << timeStr.str() << ","
-                       << std::fixed << std::setprecision(2) << timeHour << ","
-                       << minute << ","
-                       << color.r << "," << color.g << "," << color.b << ","
-                       << period << std::endl;
-            }
-        }
-        
-        csvFile.close();
-        logMessage("Debug CSV generated: " + csvPath);
-    }
-    
     
     Color getCurrentColor() {
         time_t now = time(0);
@@ -1325,7 +1316,6 @@ void main() {
         double sunrise = todaysSolarTimes.sunrise_hour;
         double sunset = todaysSolarTimes.sunset_hour;
         double solar_noon = todaysSolarTimes.solar_noon_hour;
-        double civil_twilight_end = todaysSolarTimes.civil_twilight_end;
 
         // Normalize hour to 0-24 range
         while (hour < 0) hour += 24.0;
@@ -1357,7 +1347,6 @@ void main() {
         points.push_back({std::max(13.5, solar_noon + 1.5), Color(185, 215, 225), Color(175, 212, 230), Color(140, 190, 235), 1.0, "Early Afternoon"});
 
         // Afternoon to sunset - ensure progressive timing
-        double late_afternoon_start = sunset - 2.0;
         double pre_sunset_start = sunset - 1.5;
         double pre_sunset_mid = sunset - 1.0;
         double pre_sunset_end = sunset - 0.5;
@@ -1442,41 +1431,10 @@ void main() {
         return { points.front().horizonColor, points.front().midSkyColor, points.front().zenithColor, points.front().gamma };
     }
 
-    // Get a blended color for a given hour and altitude (0.0 = horizon/bottom, 1.0 = zenith/top)
-    Color getColorForHourAndAltitude(double hour, double altitude) {
-        SkySlice slice = getSkySliceForHour(hour);
-        double t = std::pow(std::max(0.0, std::min(1.0, altitude)), slice.gamma);
-        if (t <= 0.5) {
-            return interpolateColor(slice.horizon, slice.midSky, t * 2.0);
-        } else {
-            return interpolateColor(slice.midSky, slice.zenith, (t - 0.5) * 2.0);
-        }
-    }
-
     // Backward-compatible wrapper: returns horizon color for a given hour
     Color getColorForHour(double hour, std::string* outPeriod = nullptr) {
         SkySlice slice = getSkySliceForHour(hour, outPeriod);
         return slice.horizon;
-    }
-    
-    bool isTimeBetween(double current, double start, double end) {
-        // Handle case where time range wraps around midnight
-        if (start > end) {
-            return (current >= start || current <= end);
-        }
-        return (current >= start && current <= end);
-    }
-    
-    double getProgressBetween(double current, double start, double end) {
-        if (start > end) {
-            // Handle wrap around midnight
-            if (current >= start) {
-                return (current - start) / (24.0 - start + end);
-            } else {
-                return (24.0 - start + current) / (24.0 - start + end);
-            }
-        }
-        return (current - start) / (end - start);
     }
     
     std::string getCurrentPeriod() {
@@ -1522,124 +1480,233 @@ void main() {
         } else {
             baseDir = "";
         }
-        std::string framesDir = baseDir + "earth_frames\\";
+        std::string landPath = baseDir + "earth_land.bin";
 
-        // Read every frame's compressed PNG bytes into RAM (~5 MB total) so the
-        // per-tick decode is fast and never depends on disk-cache state. We do
-        // NOT decode to pixels here; that happens one frame at a time in
-        // loadEarthFrame(). An empty buffer marks a missing frame.
-        earthFrameData.assign(kEarthFrameCount, std::vector<unsigned char>());
-        int available = 0;
-        for (int i = 0; i < kEarthFrameCount; i++) {
-            std::stringstream nameBuilder;
-            nameBuilder << framesDir << "earth_"
-                        << std::setfill('0') << std::setw(3) << i << ".png";
-            std::string framePath = nameBuilder.str();
-
-            std::ifstream f(framePath, std::ios::binary | std::ios::ate);
-            if (f.good()) {
-                std::streamsize size = f.tellg();
-                f.seekg(0, std::ios::beg);
-                std::vector<unsigned char> buf((size_t)size);
-                if (size > 0 && f.read(reinterpret_cast<char*>(buf.data()), size)) {
-                    earthFrameData[i] = std::move(buf);
-                    available++;
-                } else {
-                    std::cout << "Failed to read earth frame: " << framePath << std::endl;
-                    logMessage("Failed to read earth frame: " + framePath);
-                }
-            } else {
-                std::cout << "Missing earth frame: " << framePath << std::endl;
-                logMessage("Missing earth frame: " + framePath);
-            }
+        // Vector coastlines (Natural Earth 1:110m land, simplified for a
+        // 768 px globe by tools/build_earth_land.py). Format:
+        //   "CWEL" u16 version u16 pad u32 ringCount
+        //   per ring: u32 n, then n x (i16 lon*100, i16 lat*100)
+        // Vertices are converted to unit vectors once here; everything at
+        // runtime is a rotation + hemisphere clip + scanline fill.
+        std::ifstream f(landPath, std::ios::binary);
+        std::vector<unsigned char> bytes;
+        if (f.is_open()) {
+            bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
         }
-        earthFramesAvailable = available;
-        loadedEarthFrame = -1; // nothing decoded yet
+        auto rd16 = [&](size_t off) -> int16_t {
+            return (int16_t)(bytes[off] | (bytes[off + 1] << 8));
+        };
+        auto rd32 = [&](size_t off) -> uint32_t {
+            return (uint32_t)bytes[off] | ((uint32_t)bytes[off + 1] << 8) |
+                   ((uint32_t)bytes[off + 2] << 16) | ((uint32_t)bytes[off + 3] << 24);
+        };
 
-        if (available == 0) {
+        earthRings.clear();
+        bool ok = bytes.size() >= 12 && std::memcmp(bytes.data(), "CWEL", 4) == 0 && rd16(4) == 1;
+        size_t off = 12;
+        uint32_t ringCount = ok ? rd32(8) : 0;
+        size_t vertexTotal = 0;
+        for (uint32_t r = 0; ok && r < ringCount; r++) {
+            if (off + 4 > bytes.size()) { ok = false; break; }
+            uint32_t n = rd32(off);
+            off += 4;
+            if (n < 3 || off + (size_t)n * 4 > bytes.size()) { ok = false; break; }
+            std::vector<EarthVec> ring(n);
+            for (uint32_t i = 0; i < n; i++, off += 4) {
+                double lon = rd16(off) / 100.0 * M_PI / 180.0;
+                double lat = rd16(off + 2) / 100.0 * M_PI / 180.0;
+                double cl = std::cos(lat);
+                ring[i] = { (float)(cl * std::cos(lon)), (float)(cl * std::sin(lon)), (float)std::sin(lat) };
+            }
+            vertexTotal += n;
+            earthRings.push_back(std::move(ring));
+        }
+
+        if (!ok || earthRings.empty()) {
             hasWatermark = false;
-            earthFrameData.clear();
-            std::cout << "ERROR: no earth frames found in " << framesDir
+            earthRings.clear();
+            std::cout << "ERROR: earth_land.bin missing or invalid at " << landPath
                       << " - watermark disabled" << std::endl;
-            logMessage("No earth frames found - watermark disabled");
+            logMessage("earth_land.bin missing or invalid - watermark disabled");
             return;
         }
 
+        if (!earthTexture.create(kEarthSize, kEarthSize)) {
+            hasWatermark = false;
+            earthRings.clear();
+            std::cout << "ERROR: could not create earth texture - watermark disabled" << std::endl;
+            logMessage("Earth texture creation failed - watermark disabled");
+            return;
+        }
+        earthTexture.setSmooth(true);
+
         hasWatermark = true;
-        // Decode the frame matching the current UTC time so there's something
+        // Draw the globe for the current UTC minute so there's something
         // correct to show immediately.
-        currentEarthFrame = nearestAvailableFrame(computeEarthFrameForNow());
-        loadEarthFrame(currentEarthFrame);
+        ensureEarthRendered(computeEarthMinuteForNow());
 
-        size_t ramBytes = 0;
-        for (auto& b : earthFrameData) ramBytes += b.size();
-        if (available == kEarthFrameCount) {
-            std::cout << "Loaded all " << available << " earth frames into RAM ("
-                      << (ramBytes / 1024) << " KB compressed); decoding 1/tick" << std::endl;
-            logMessage("Earth frames in RAM: " + std::to_string(available));
-        } else {
-            std::cout << "WARNING: only " << available << "/" << kEarthFrameCount
-                      << " earth frames present - animation will skip gaps" << std::endl;
-            logMessage("Partial earth frames present: " + std::to_string(available));
-        }
+        std::cout << "Loaded earth coastlines: " << earthRings.size() << " rings, "
+                  << vertexTotal << " vertices (" << (bytes.size() / 1024) << " KB); "
+                  << "re-rendered once per minute" << std::endl;
+        logMessage("Earth coastlines loaded: " + std::to_string(vertexTotal) + " vertices");
     }
 
-    // Decode frame `index` from its in-RAM PNG bytes into the single
-    // earthTexture, but only if it isn't already loaded. Returns true if
-    // earthTexture holds a valid frame afterward. Skips indices with no data
-    // (partial sets) without disturbing the currently-loaded frame.
-    bool loadEarthFrame(int index) {
-        if (index < 0 || index >= (int)earthFrameData.size()) return loadedEarthFrame >= 0;
-        if (index == loadedEarthFrame) return true;            // already resident
-        if (earthFrameData[index].empty()) return loadedEarthFrame >= 0; // missing frame
-
-        if (earthTexture.loadFromMemory(earthFrameData[index].data(),
-                                        earthFrameData[index].size())) {
-            earthTexture.setSmooth(true);
-            loadedEarthFrame = index;
-            return true;
-        }
-        std::cout << "Failed to decode earth frame " << index << std::endl;
-        logMessage("Failed to decode earth frame " + std::to_string(index));
-        return loadedEarthFrame >= 0;
-    }
-
-    // Frame index for the current UTC time: earth_000 at 12:00 (noon) UTC,
-    // advancing one frame every kEarthMinutesPerFrame minutes and wrapping
-    // after a full day.
-    int computeEarthFrameForNow() {
+    // Minutes since 12:00 UTC (0..1439). The globe is viewed from directly
+    // above the meridian that faces the sun at noon UTC (longitude 0) and
+    // turns 0.25 deg per minute, one full rotation per day.
+    int computeEarthMinuteForNow() {
         time_t now = time(0);
         tm* utc = gmtime(&now);
         int minutesSinceNoon = (utc->tm_hour - 12) * 60 + utc->tm_min;
         if (minutesSinceNoon < 0) minutesSinceNoon += 24 * 60;
-        return (minutesSinceNoon / kEarthMinutesPerFrame) % kEarthFrameCount;
+        return minutesSinceNoon % kEarthMinutesPerDay;
     }
 
-    // Nearest present frame at or after `index`, wrapping around. Skips
-    // missing frames (partial sets) so a gap falls forward to the next
-    // available frame instead of stalling the rotation.
-    int nearestAvailableFrame(int index) {
-        for (int step = 0; step < kEarthFrameCount; step++) {
-            int candidate = (index + step) % kEarthFrameCount;
-            if (!earthFrameData[candidate].empty()) return candidate;
-        }
-        return index;
+    // Make earthTexture show the globe for `minuteSinceNoonUTC`, rendering
+    // only if it isn't already showing that minute. Returns true if the
+    // texture holds a valid globe afterward.
+    bool ensureEarthRendered(int minuteSinceNoonUTC) {
+        if (!hasWatermark) return false;
+        if (minuteSinceNoonUTC == renderedEarthMinute) return true;
+        renderEarth(-360.0 * minuteSinceNoonUTC / kEarthMinutesPerDay);
+        renderedEarthMinute = minuteSinceNoonUTC;
+        return true;
     }
 
-    // Called once per render tick. The frame shown is derived from UTC time,
-    // so most ticks this is just a cheap re-bind of the resident texture; a
-    // decode only happens when a kEarthMinutesPerFrame boundary passes. Being
-    // a pure function of time, it also self-corrects after sleep/wake.
-    void updateEarthFrameSprites() {
-        if (!hasWatermark) return;
+    // Rasterize the globe with longitude `lon0Deg` facing the viewer into
+    // earthTexture. Output matches the old pre-rendered frames: ocean is
+    // opaque black, land and the area outside the disc are transparent, with
+    // hard (unantialiased) edges. A thin opaque rim (kEarthRimPx) always
+    // outlines the disc so land that reaches the limb doesn't merge into the
+    // sky behind it. North is up; no axial tilt.
+    //
+    // Each ring is rotated on the sphere, clipped to the visible hemisphere
+    // (Sutherland-Hodgman against z >= 0; the cut is closed along the limb
+    // circle so coastlines meeting the edge of the disc stay flush with it),
+    // projected orthographically, and filled with an even-odd scanline pass.
+    // Even-odd handles holes (the Caspian) and the seam-free merged rings.
+    // ~4k vertices and 768 rows: about 2 ms of work including the texture
+    // upload (see --earth-preview), once a minute. The RGBA staging buffer is
+    // local so no multi-MB CPU copy lingers between renders.
+    void renderEarth(double lon0Deg) {
+        const int S = kEarthSize;
+        const double R = S / 2.0, cx = S / 2.0, cy = S / 2.0;
+        const double c0 = std::cos(lon0Deg * M_PI / 180.0);
+        const double s0 = std::sin(lon0Deg * M_PI / 180.0);
 
-        int target = nearestAvailableFrame(computeEarthFrameForNow());
-        if (target != currentEarthFrame) {
-            // Decode the new frame. If it can't be loaded, keep the current one.
-            if (loadEarthFrame(target)) {
-                currentEarthFrame = loadedEarthFrame;
+        // Per-scanline x crossings of land-ring edges (pixel-centre sampling).
+        std::vector<std::vector<float>> rows(S);
+        std::vector<std::pair<double,double>> pts; // projected ring, unit disc coords
+        std::vector<std::array<double,3>> view;
+
+        auto addEdge = [&](double x0, double y0, double x1, double y1) {
+            if (y0 == y1) return;
+            if (y0 > y1) { std::swap(x0, x1); std::swap(y0, y1); }
+            int r0 = std::max(0, (int)std::ceil(y0 - 0.5));
+            int r1 = std::min(S - 1, (int)std::ceil(y1 - 0.5) - 1);
+            if (r1 < r0) return;
+            double slope = (x1 - x0) / (y1 - y0);
+            for (int r = r0; r <= r1; r++) {
+                rows[r].push_back((float)(x0 + (r + 0.5 - y0) * slope));
+            }
+        };
+        auto emitArc = [&](double ax, double ay, double bx, double by) {
+            // Walk the limb circle the short way from a to b.
+            double a1 = std::atan2(ay, ax), a2 = std::atan2(by, bx);
+            double d = a2 - a1;
+            while (d >  M_PI) d -= 2 * M_PI;
+            while (d < -M_PI) d += 2 * M_PI;
+            int steps = std::max(1, (int)(std::fabs(d) / (M_PI / 180.0)));
+            for (int k = 1; k < steps; k++) {
+                double ang = a1 + d * k / steps;
+                pts.emplace_back(std::cos(ang), std::sin(ang));
+            }
+        };
+
+        for (const auto& ring : earthRings) {
+            const size_t n = ring.size();
+            view.resize(n);
+            int start = -1;
+            for (size_t i = 0; i < n; i++) {
+                const EarthVec& e = ring[i];
+                double x = e.y * c0 - e.x * s0;   // cos(lat) sin(lon - lon0)
+                double z = e.x * c0 + e.y * s0;   // cos(lat) cos(lon - lon0)
+                view[i] = { x, (double)e.z, z };
+                if (start < 0 && z >= 0) start = (int)i;
+            }
+            if (start < 0) continue; // whole ring on the far side
+
+            pts.clear();
+            bool havePendingExit = false;
+            double exitX = 0, exitY = 0;
+            for (size_t k = 0; k < n; k++) {
+                const auto& p = view[(start + k) % n];
+                const auto& q = view[(start + k + 1) % n];
+                bool pin = p[2] >= 0, qin = q[2] >= 0;
+                if (pin && qin) {
+                    pts.emplace_back(q[0], q[1]);
+                } else if (pin != qin) {
+                    double t = p[2] / (p[2] - q[2]);
+                    double ix = p[0] + (q[0] - p[0]) * t;
+                    double iy = p[1] + (q[1] - p[1]) * t;
+                    if (pin) {               // leaving the visible hemisphere
+                        pts.emplace_back(ix, iy);
+                        exitX = ix; exitY = iy; havePendingExit = true;
+                    } else {                 // re-entering
+                        if (havePendingExit) { emitArc(exitX, exitY, ix, iy); havePendingExit = false; }
+                        pts.emplace_back(ix, iy);
+                        pts.emplace_back(q[0], q[1]);
+                    }
+                }
+            }
+            if (pts.size() < 3) continue;
+            for (size_t i = 0; i < pts.size(); i++) {
+                const auto& a = pts[i];
+                const auto& b = pts[(i + 1) % pts.size()];
+                addEdge(cx + a.first * R, cy - a.second * R, cx + b.first * R, cy - b.second * R);
             }
         }
+
+        std::vector<sf::Uint8> rgba((size_t)S * S * 4, 0); // transparent black
+        for (int y = 0; y < S; y++) {
+            double dy = (y + 0.5 - cy) / R;
+            if (std::fabs(dy) >= 1.0) continue;
+            double half = std::sqrt(1.0 - dy * dy) * R;
+            int x0 = std::max(0, (int)std::ceil(cx - half - 0.5));
+            int x1 = std::min(S - 1, (int)std::ceil(cx + half - 0.5) - 1);
+            sf::Uint8* row = &rgba[(size_t)y * S * 4];
+            for (int x = x0; x <= x1; x++) row[x * 4 + 3] = 255; // ocean
+            auto& xs = rows[y];
+            std::sort(xs.begin(), xs.end());
+            for (size_t i = 0; i + 1 < xs.size(); i += 2) {
+                int a = std::max(x0, (int)std::ceil(xs[i] - 0.5));
+                int b = std::min(x1, (int)std::ceil(xs[i + 1] - 0.5) - 1);
+                for (int x = a; x <= b; x++) row[x * 4 + 3] = 0;   // land
+            }
+            // Rim: re-opaque the pixels between the inner and outer radius.
+            double innerR = R - kEarthRimPx;
+            double dyPx = std::fabs(y + 0.5 - cy);
+            if (dyPx >= innerR) {
+                for (int x = x0; x <= x1; x++) row[x * 4 + 3] = 255;
+            } else {
+                double halfI = std::sqrt(innerR * innerR - dyPx * dyPx);
+                int xi0 = std::max(x0, (int)std::ceil(cx - halfI - 0.5));
+                int xi1 = std::min(x1, (int)std::ceil(cx + halfI - 0.5) - 1);
+                for (int x = x0; x < xi0; x++) row[x * 4 + 3] = 255;
+                for (int x = xi1 + 1; x <= x1; x++) row[x * 4 + 3] = 255;
+            }
+        }
+        earthTexture.update(rgba.data());
+    }
+
+    // Called once per render tick. The view longitude is derived from UTC
+    // time, so most ticks this is just a cheap re-bind of the resident
+    // texture; a re-render only happens when the minute changes. Being a pure
+    // function of time, it also self-corrects after sleep/wake.
+    void updateEarthSprites() {
+        if (!hasWatermark) return;
+
+        ensureEarthRendered(computeEarthMinuteForNow());
 
         if (earthTexture.getSize().x == 0) return;
 
@@ -1659,8 +1726,7 @@ void main() {
         return computeWatermarkInvertProgressForHour(h);
     }
 
-    // Same day/night inversion curve, but for an arbitrary local hour so demo
-    // mode can evaluate it for simulated times.
+    // Same day/night inversion curve, but for an arbitrary local hour.
     float computeWatermarkInvertProgressForHour(double h) {
         double sunrise = todaysSolarTimes.sunrise_hour;
         double sunset  = todaysSolarTimes.sunset_hour;
@@ -1691,7 +1757,7 @@ void main() {
 
     void renderDebugStrip() {
         float invertProgress = computeWatermarkInvertProgress();
-        updateEarthFrameSprites();
+        updateEarthSprites();
         for (auto& m : monitors) {
             if (m.window && m.window->isOpen()) {
                 const int stripHeight = 300;
@@ -1743,8 +1809,7 @@ void main() {
         return buildGradientInto(m.gradientRT.get(), m.width, m.height, slice);
     }
 
-    // Core of the GPU gradient fill, target-agnostic so demo mode can render
-    // into its own offscreen RenderTexture.
+    // Core of the GPU gradient fill, target-agnostic (takes any RenderTexture).
     bool buildGradientInto(sf::RenderTexture* rt, int width, int height, const SkySlice& slice) {
         if (!gradientShaderLoaded || !fullscreenTexReady || !rt) return false;
 
@@ -1864,14 +1929,14 @@ void main() {
         m.window->display();
     }
 
-    void renderFrame(const Color& bgColor) {
+    void renderFrame() {
         if (config.debug_mode) {
             renderDebugStrip();
             return;
         }
 
         float invertProgress = computeWatermarkInvertProgress();
-        updateEarthFrameSprites();
+        updateEarthSprites();
 
         // Get current time and compute sky slice once per frame
         time_t now = time(0);
@@ -1886,8 +1951,62 @@ void main() {
     }
 
     void updateDisplay() {
-        Color currentColor = getCurrentColor();
-        renderFrame(currentColor);
+        renderFrame();
+    }
+
+    // Dynamic tick: how long the main loop waits between change checks.
+    // Within 10 minutes of sunrise or sunset the palette moves fastest, so
+    // check every 0.25 s; within 30 minutes, every 0.5 s; otherwise every
+    // second. Distances wrap around midnight.
+    float currentTickIntervalSec() {
+        time_t now = time(0);
+        tm* ti = localtime(&now);
+        double hour = ti->tm_hour + ti->tm_min / 60.0 + ti->tm_sec / 3600.0;
+        auto minutesFrom = [hour](double eventHour) {
+            double d = std::fabs(hour - eventHour);
+            if (d > 12.0) d = 24.0 - d;
+            return d * 60.0;
+        };
+        double m = std::min(minutesFrom(todaysSolarTimes.sunrise_hour),
+                            minutesFrom(todaysSolarTimes.sunset_hour));
+        if (m <= 10.0) return 0.25f;
+        if (m <= 30.0) return 0.5f;
+        return 1.0f;
+    }
+
+    // Everything that determines what a frame looks like, reduced to a
+    // comparable value. If two ticks produce equal keys, repainting would
+    // present a pixel-identical frame, so the main loop skips it. The
+    // palette is already 8-bit; gamma and the inversion ramp are continuous
+    // and are quantized to 1/256, far below anything visible.
+    struct FrameKey {
+        int c[9];           // horizon, midSky, zenith RGB
+        int gammaQ;
+        int invertQ;
+        int earthMinute;
+        size_t monitorCount;
+        bool debug;
+        bool operator!=(const FrameKey& o) const {
+            return std::memcmp(this, &o, sizeof(FrameKey)) != 0;
+        }
+    };
+    FrameKey computeFrameKey() {
+        time_t now = time(0);
+        tm* ti = localtime(&now);
+        double hour = ti->tm_hour + ti->tm_min / 60.0 + ti->tm_sec / 3600.0;
+        SkySlice s = getSkySliceForHour(hour);
+        FrameKey k;
+        std::memset(&k, 0, sizeof(k)); // zero padding so memcmp is exact
+        const Color* cs[3] = { &s.horizon, &s.midSky, &s.zenith };
+        for (int i = 0; i < 3; i++) {
+            k.c[i * 3] = cs[i]->r; k.c[i * 3 + 1] = cs[i]->g; k.c[i * 3 + 2] = cs[i]->b;
+        }
+        k.gammaQ = (int)std::lround(s.gamma * 256.0);
+        k.invertQ = (int)std::lround(computeWatermarkInvertProgress() * 256.0);
+        k.earthMinute = hasWatermark ? computeEarthMinuteForNow() : -1;
+        k.monitorCount = monitors.size();
+        k.debug = config.debug_mode;
+        return k;
     }
     
     void createMessageWindow() {
@@ -1932,11 +2051,11 @@ void main() {
 
     void run() {
         std::cout << "\nStarting CircadianWallpaper..." << std::endl;
-        std::cout << "Display will update every 15 seconds for smooth color transitions" << std::endl;
+        std::cout << "Display repaints only when the sky, the globe, or the desktop changes" << std::endl;
         std::cout << "Use Task Manager to terminate the application" << std::endl << std::endl;
 
         logMessage("Starting CircadianWallpaper...");
-        logMessage("Display will update every 15 seconds for smooth color transitions");
+        logMessage("Display repaints only when the sky, the globe, or the desktop changes");
 
         // Create hidden window for power management messages
         createMessageWindow();
@@ -1954,23 +2073,30 @@ void main() {
             startAsyncSolarFetch();
         }
         std::cout << "Generating color schedule..." << std::endl;
-        generateTodaysColors();
+        logSolarSchedule();
 
         int updateCount = 0;
         std::string lastDate = getCurrentDate();
         sf::Clock updateClock;
         sf::Clock zOrderClock;  // re-pins the wallpaper below the taskbar
-        sf::Clock renderClock;  // throttles the full-screen gradient rebuild
+        sf::Clock tickClock;    // paces the main loop
+        sf::Clock topologyPollClock; // periodic self-healing topology check
+        sf::Clock solarRetryClock;   // re-attempts a failed daily solar refresh
 
-        // Render cadence for BOTH the sky gradient and the earth animation
-        // (updateEarthFrameSprites runs inside renderFrame). 0.25s = ~4 fps,
-        // keeping CPU low. The earth frame is derived from UTC time and only
-        // changes every kEarthMinutesPerFrame minutes (see updateEarthFrameSprites).
-        const float kRenderIntervalSec = 0.25f;
+        // Loop cadence. Each tick only *checks* whether anything on screen
+        // would differ (see computeFrameKey) and repaints when it would;
+        // the check is a few microseconds. The tick length adapts to how
+        // fast the sky is moving (see currentTickIntervalSec): 1 s for most
+        // of the day, tightening to 0.5 s and then 0.25 s around sunrise and
+        // sunset, where the palette steps fastest. Expose, wake and topology
+        // events still cut the wait short and repaint immediately.
+        FrameKey lastFrameKey = computeFrameKey();
+        long repaintCount = 0;
 
         // Do initial render and set initial accent color
         std::cout << "Rendering initial frame..." << std::endl;
         updateDisplay();
+        repaintCount++;
         updateCount++;
 
         Color initialColor = getCurrentColor();
@@ -2023,6 +2149,22 @@ void main() {
                     topologyReconcilePending = true;
                     topologySettleClock.restart();
                 }
+                // Safety net: independent of any message ever arriving, poll
+                // the real topology every 2s and re-arm the same debounced
+                // reconcile path if it no longer matches what we last
+                // reconciled to. This is what actually fixes the case where
+                // WM_DISPLAYCHANGE/WM_DEVICECHANGE fired but EnumDisplayMonitors
+                // hadn't settled yet when we reconciled against it (or fired
+                // too early/late to be seen at all) — the next poll catches
+                // the drift and tries again a second later.
+                if (!topologyReconcilePending &&
+                    topologyPollClock.getElapsedTime().asSeconds() >= 2.0f) {
+                    topologyPollClock.restart();
+                    if (topologyMismatch()) {
+                        topologyReconcilePending = true;
+                        topologySettleClock.restart();
+                    }
+                }
                 if (topologyReconcilePending &&
                     topologySettleClock.getElapsedTime().asSeconds() >= 1.0f) {
                     topologyReconcilePending = false;
@@ -2057,15 +2199,28 @@ void main() {
                 if (currentDate != lastDate) {
                     logMessage("New day detected, refreshing solar times...");
                     applySolarTimesFromCache();
-                    generateTodaysColors();
+                    logSolarSchedule();
                     if (solarRefreshNeeded()) startAsyncSolarFetch();
                     lastDate = currentDate;
                     forceUpdate = true;
                 }
 
-                // Check if it's time for periodic update (every 15 seconds)
+                // If the daily refresh failed (e.g. no network at midnight),
+                // try again every 15 minutes rather than riding stale data
+                // until tomorrow.
+                if (solarRetryClock.getElapsedTime().asSeconds() >= 900.0f) {
+                    solarRetryClock.restart();
+                    if (solarRefreshNeeded()) {
+                        logMessage("Solar data stale - retrying background refresh");
+                        startAsyncSolarFetch();
+                    }
+                }
+
+                // Periodic status tick (every 15 seconds). Informational only;
+                // it no longer forces a repaint.
+                bool statusTick = false;
                 if (updateClock.getElapsedTime().asSeconds() >= 15.0f) {
-                    forceUpdate = true;
+                    statusTick = true;
                     updateClock.restart();
                 }
 
@@ -2078,18 +2233,24 @@ void main() {
                     zOrderClock.restart();
                 }
 
-                // Render every iteration. The loop is paced to kRenderIntervalSec
-                // by the frame-budget sleep at the bottom, so this runs at the
-                // target fps (~10). Each render advances the earth one frame and
-                // resamples the continuously-drifting sky color. renderClock
-                // measures this iteration's work so we sleep only the remainder.
+                // Repaint only when the frame would actually differ from the
+                // one on screen (sky slice, inversion, globe minute, monitor
+                // count), or when something external demands it: an expose
+                // (DWM dropped our surface), wake, topology reconcile, or a
+                // new day's palette. Between those, the loop just ticks.
+                tickClock.restart();
                 if (g_exposeRequested) {
                     g_exposeRequested = false;
+                    forceUpdate = true;
                     logMessage("Window exposed (WM_PAINT) - repainting immediately");
                 }
-                renderClock.restart();
-                updateDisplay();
-                if (forceUpdate) {
+                FrameKey key = computeFrameKey();
+                if (forceUpdate || key != lastFrameKey) {
+                    updateDisplay();
+                    lastFrameKey = key;
+                    repaintCount++;
+                }
+                if (statusTick) {
                     updateCount++;
 
                     {
@@ -2104,7 +2265,8 @@ void main() {
                                                + " | RGB(" + std::to_string(currentColor.r) + ", "
                                                + std::to_string(currentColor.g) + ", "
                                                + std::to_string(currentColor.b) + ")"
-                                               + " | Source: " + todaysSolarTimes.source;
+                                               + " | Source: " + todaysSolarTimes.source
+                                               + " | repaints: " + std::to_string(repaintCount);
 
                         std::cout << statusMsg << std::endl;
                         // Only persist the 15-second status line in debug mode
@@ -2121,8 +2283,8 @@ void main() {
                     lastAccentColorUpdate = now;
                 }
 
-                // Frame-budget wait: spend the rest of this frame's
-                // kRenderIntervalSec budget waiting ON THE MESSAGE QUEUE
+                // Tick-budget wait: spend the rest of this tick's
+                // currentTickIntervalSec() budget waiting ON THE MESSAGE QUEUE
                 // instead of sleeping blind. A plain sleep left window
                 // messages queued for up to 250 ms — so when a window closed
                 // over the wallpaper and DWM asked us to repaint the exposed
@@ -2131,8 +2293,8 @@ void main() {
                 // moment anything arrives; exposure/wake/topology events then
                 // cut the wait short so the next render happens immediately.
                 for (;;) {
-                    float spent = renderClock.getElapsedTime().asSeconds();
-                    float remaining = kRenderIntervalSec - spent;
+                    float spent = tickClock.getElapsedTime().asSeconds();
+                    float remaining = currentTickIntervalSec() - spent;
                     if (remaining <= 0.0f) break;
                     DWORD wait = MsgWaitForMultipleObjects(
                         0, NULL, FALSE, (DWORD)(remaining * 1000.0f), QS_ALLINPUT);
@@ -2155,143 +2317,31 @@ void main() {
         }
     }
 
-    // Demo mode: render one snapshot per earth-frame cycle (every 5 simulated
-    // minutes -> 288 frames = one full day) into demo_frames\ next to
-    // config.ini, each stamped with the simulated local time under the earth,
-    // then encode them into demo.mp4 at 16 snapshots per second with ffmpeg.
-    int runDemo() {
+    // Dev aid: dump the rasterized globe at four UTC hours so the vector
+    // renderer can be eyeballed without running the wallpaper.
+    int runEarthPreview(const std::string& dir) {
         if (!hasWatermark) {
-            std::cout << "Demo requires earth frames (earth_frames\\ next to config.ini) - aborting" << std::endl;
+            std::cout << "Preview requires earth_land.bin next to config.ini - aborting" << std::endl;
             return 1;
         }
-
-        int width = GetSystemMetrics(SM_CXSCREEN);
-        int height = GetSystemMetrics(SM_CYSCREEN);
-        std::cout << "Demo render target: " << width << "x" << height << std::endl;
-
-        sf::RenderTexture gradientRT, frameRT;
-        if (!gradientRT.create(width, height) || !frameRT.create(width, height)) {
-            std::cout << "Failed to create offscreen render targets" << std::endl;
-            return 1;
-        }
-
-        sf::Font font;
-        bool fontLoaded = font.loadFromFile("C:\\Windows\\Fonts\\segoeui.ttf") ||
-                          font.loadFromFile("C:\\Windows\\Fonts\\arial.ttf");
-        if (!fontLoaded) {
-            std::cout << "Warning: no system font found - timestamps disabled" << std::endl;
-        }
-
-        // Output lives next to config.ini, like the app's other assets.
-        std::string baseDir;
-        {
-            std::string configPath = getConfigPath();
-            size_t lastSlash = configPath.find_last_of("\\/");
-            baseDir = (lastSlash != std::string::npos) ? configPath.substr(0, lastSlash + 1) : "";
-        }
-        std::string outDir = baseDir + "demo_frames\\";
-        CreateDirectoryA(outDir.c_str(), NULL);
-
-        // Simulated local minutes -> UTC minutes for the earth frame index
-        // (earth_000 = 12:00 UTC), same bias math as parseTimeString.
-        TIME_ZONE_INFORMATION tzi;
-        DWORD tzResult = GetTimeZoneInformation(&tzi);
-        LONG biasMinutes = tzi.Bias +
-            ((tzResult == TIME_ZONE_ID_DAYLIGHT) ? tzi.DaylightBias : tzi.StandardBias);
-
-        for (int i = 0; i < kEarthFrameCount; i++) {
-            int localMinutes = i * kEarthMinutesPerFrame;
-            double hour = localMinutes / 60.0;
-            SkySlice slice = getSkySliceForHour(hour);
-            float invertProgress = computeWatermarkInvertProgressForHour(hour);
-
-            int minutesSinceNoonUTC = (localMinutes + biasMinutes) - 12 * 60;
-            while (minutesSinceNoonUTC < 0) minutesSinceNoonUTC += 24 * 60;
-            int frameIdx = nearestAvailableFrame(
-                (minutesSinceNoonUTC / kEarthMinutesPerFrame) % kEarthFrameCount);
-            if (!loadEarthFrame(frameIdx)) continue;
-
-            sf::Sprite earth(earthTexture);
-            sf::FloatRect eb = earth.getLocalBounds();
-            earth.setOrigin(eb.width / 2.0f, eb.height / 2.0f);
-            earth.setPosition(width / 2.0f, height / 2.0f);
-
-            bool gpu = buildGradientInto(&gradientRT, width, height, slice);
-            sf::Texture cpuTexture;
-            const sf::Texture* gradientTexturePtr;
-            if (gpu) {
-                gradientTexturePtr = &gradientRT.getTexture();
-            } else {
-                sf::Image gradientImage;
-                buildGradientCPU(width, height, slice, gradientImage);
-                cpuTexture.loadFromImage(gradientImage);
-                gradientTexturePtr = &cpuTexture;
-            }
-
-            frameRT.clear();
-            frameRT.draw(sf::Sprite(*gradientTexturePtr));
-
-            if (watermarkShaderLoaded) {
-                watermarkShader.setUniform("texture", sf::Shader::CurrentTexture);
-                watermarkShader.setUniform("background", *gradientTexturePtr);
-                watermarkShader.setUniform("invertAmount", invertProgress);
-                watermarkShader.setUniform("resolution",
-                    sf::Glsl::Vec2((float)width, (float)height));
-                // Same orientation rule as renderMonitor: RenderTexture
-                // background is GL-oriented (no flip), CPU image needs a flip.
-                watermarkShader.setUniform("backgroundFlipY", gpu ? 0.0f : 1.0f);
-                frameRT.draw(earth, &watermarkShader);
-            } else {
-                frameRT.draw(earth);
-            }
-
-            if (fontLoaded) {
-                int h24 = localMinutes / 60;
-                int mm = localMinutes % 60;
-                int h12 = h24 % 12;
-                if (h12 == 0) h12 = 12;
-                std::stringstream ts;
-                ts << h12 << ":" << std::setfill('0') << std::setw(2) << mm
-                   << " " << (h24 < 12 ? "AM" : "PM");
-                sf::Text stamp(ts.str(), font, 48);
-                sf::FloatRect tb = stamp.getLocalBounds();
-                stamp.setOrigin(tb.left + tb.width / 2.0f, tb.top);
-                stamp.setPosition(width / 2.0f, height / 2.0f + eb.height / 2.0f + 28.0f);
-                stamp.setFillColor(sf::Color(0xFF, 0xCB, 0xAF));
-                stamp.setOutlineColor(sf::Color::Black);
-                stamp.setOutlineThickness(2.0f);
-                frameRT.draw(stamp);
-            }
-
-            frameRT.display();
-
+        CreateDirectoryA(dir.c_str(), NULL);
+        for (int hour : {0, 6, 12, 18}) {
+            int minute = ((hour - 12) * 60 + kEarthMinutesPerDay) % kEarthMinutesPerDay;
+            renderedEarthMinute = -1;
+            auto t0 = std::chrono::steady_clock::now();
+            ensureEarthRendered(minute);
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::cout << "Rendered globe for " << hour << ":00 UTC in " << us << " us" << std::endl;
             std::stringstream name;
-            name << outDir << "frame_" << std::setfill('0') << std::setw(3) << i << ".png";
-            if (!frameRT.getTexture().copyToImage().saveToFile(name.str())) {
+            name << dir << "\\earth_utc" << std::setfill('0') << std::setw(2) << hour << ".png";
+            if (!earthTexture.copyToImage().saveToFile(name.str())) {
                 std::cout << "Failed to save " << name.str() << std::endl;
                 return 1;
             }
-
-            if (i % 24 == 0) {
-                std::cout << "Rendered " << i << "/" << kEarthFrameCount << " snapshots" << std::endl;
-            }
+            std::cout << "Wrote " << name.str() << std::endl;
         }
-        std::cout << "Rendered " << kEarthFrameCount << " snapshots to " << outDir << std::endl;
-
-        std::string videoPath = baseDir + "demo.mp4";
-        std::string cmd = "ffmpeg -y -framerate 16 -i \"" + outDir +
-                          "frame_%03d.png\" -c:v libx264 -pix_fmt yuv420p -crf 18 \"" +
-                          videoPath + "\"";
-        std::cout << "Encoding video..." << std::endl;
-        int rc = std::system(cmd.c_str());
-        if (rc == 0) {
-            std::cout << "Demo video written to " << videoPath << std::endl;
-        } else {
-            std::cout << "ffmpeg failed or not found (exit " << rc
-                      << "). Frames are in " << outDir
-                      << " - encode manually with:\n  " << cmd << std::endl;
-        }
-        return rc == 0 ? 0 : 1;
+        return 0;
     }
 
     std::string getLogPath() {
@@ -2340,14 +2390,14 @@ int main(int argc, char* argv[]) {
         if (mode == "--help" || mode == "-h") {
             std::cout << "\nUsage:" << std::endl;
             std::cout << "  CircadianWallpaper.exe              - Run fullscreen color overlay based on solar position" << std::endl;
-            std::cout << "  CircadianWallpaper.exe --demo       - Render a full simulated day (288 snapshots, 5 min apart) and encode demo.mp4 at 16 fps" << std::endl;
+            std::cout << "  CircadianWallpaper.exe --earth-preview <dir> - Write the globe at 00:00, 06:00, 12:00 and 18:00 UTC as PNGs into <dir>" << std::endl;
             std::cout << "  CircadianWallpaper.exe --help       - Show this help" << std::endl;
             std::cout << "\nFeatures:" << std::endl;
             std::cout << "  • Fullscreen SFML overlay (fast, no wallpaper API calls)" << std::endl;
             std::cout << "  • Automatic location detection via IP geolocation" << std::endl;
             std::cout << "  • Real astronomical data for your location" << std::endl;
             std::cout << "  • Real-time color transitions based on sun position" << std::endl;
-            std::cout << "  • Animated earth watermark (earth_frames/, one rotation per day, 5 min per frame, earth_000 = noon UTC)" << std::endl;
+            std::cout << "  • Animated earth watermark (vector coastlines in earth_land.bin, one rotation per day, redrawn every minute, longitude 0 faces viewer at noon UTC)" << std::endl;
             std::cout << "  • Wake from sleep detection - updates immediately on resume" << std::endl;
             std::cout << "  • All output is logged to log.txt file" << std::endl;
             std::cout << "\nControls:" << std::endl;
@@ -2357,11 +2407,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Demo mode renders offscreen and exits; it may run alongside the live
+    // Preview mode renders offscreen and exits; it may run alongside the live
     // wallpaper, so it deliberately skips the single-instance guard.
-    if (argc > 1 && std::string(argv[1]) == "--demo") {
+    if (argc > 2 && std::string(argv[1]) == "--earth-preview") {
         CircadianWallpaper app(true);
-        return app.runDemo();
+        return app.runEarthPreview(argv[2]);
     }
 
     // Single-instance guard: startup can fire a second launch (e.g. if the Run
