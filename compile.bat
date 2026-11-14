@@ -1,5 +1,5 @@
 @echo off
-echo Compiling Circadian Wallpaper v3.0...
+echo Compiling Circadian Wallpaper v4.0...
 
 del CircadianWallpaper.exe 2>nul
 
