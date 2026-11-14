@@ -4,7 +4,7 @@ CircadianWallpaper automatically changes your desktop wallpaper based on real as
 
 ## Quick Start
 
-To run every time you login - Compile or move CircadianWallpaper.exe here:
+To run every time you login, compile and move CircadianWallpaper.exe here:
    ```
    %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
    ```
